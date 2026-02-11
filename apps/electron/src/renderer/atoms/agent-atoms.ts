@@ -46,6 +46,8 @@ export interface AgentStreamState {
   contextWindow?: number
   /** 是否正在压缩上下文 */
   isCompacting?: boolean
+  /** 当前 turn 中 text_delta 累积的字符数（用于 text_complete 兜底判断） */
+  _deltaLenSinceComplete?: number
 }
 
 /** 从 ToolActivity 派生状态 */
@@ -75,7 +77,7 @@ function mergeTodoWrites(activities: ToolActivity[]): ToolActivity[] {
 
   if (todoWrites.length === 0) return activities
 
-  const latest = todoWrites[todoWrites.length - 1]
+  const latest = todoWrites[todoWrites.length - 1]!
   const allDone = todoWrites.every((t) => t.done)
 
   const merged: ToolActivity = {
@@ -205,10 +207,18 @@ export function applyAgentEvent(
 ): AgentStreamState {
   switch (event.type) {
     case 'text_delta':
-      return { ...prev, content: prev.content + event.text }
+      return {
+        ...prev,
+        content: prev.content + event.text,
+        _deltaLenSinceComplete: (prev._deltaLenSinceComplete ?? 0) + event.text.length,
+      }
 
     case 'text_complete':
-      return prev
+      // 兜底：当没有收到 text_delta（如 MCP 工具调用后）时，使用 text_complete 的完整文本
+      if (event.text && (prev._deltaLenSinceComplete ?? 0) === 0) {
+        return { ...prev, content: prev.content + event.text, _deltaLenSinceComplete: 0 }
+      }
+      return { ...prev, _deltaLenSinceComplete: 0 }
 
     case 'tool_start': {
       const existing = prev.toolActivities.find((t) => t.toolUseId === event.toolUseId)

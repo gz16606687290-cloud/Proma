@@ -41,6 +41,126 @@ import {
   isActivityGroup,
 } from '@/atoms/agent-atoms'
 
+// ===== 媒体 URL 提取（图片 + 视频） =====
+
+/** 图片扩展名正则 */
+const IMAGE_EXT_RE = /\.(jpe?g|png|gif|webp)(\?|$)/i
+/** 视频扩展名正则 */
+const VIDEO_EXT_RE = /\.(mp4|webm|ogg|mov)(\?|$)/i
+
+/** 提取结果中的媒体（图片 + 视频）URL */
+interface MediaUrls {
+  images: string[]
+  videos: string[]
+}
+
+/**
+ * 递归从解析后的 JSON 结构中收集媒体 URL
+ *
+ * 支持以下格式：
+ * - Anthropic image content block: { type: "image", source: { type: "base64"|"url", ... } }
+ * - MCP image content: { type: "image", data: "base64...", mimeType: "..." }
+ * - 常见 URL 字段: url / image_url / imageUrl / src / image / video_url / videoUrl / video
+ * - 常见数组字段: urls / images / content / data / results
+ */
+function collectMediaUrls(data: unknown, media: MediaUrls, depth = 0): void {
+  if (depth > 5 || !data) return
+
+  if (typeof data === 'string') {
+    if (data.startsWith('http')) {
+      if (IMAGE_EXT_RE.test(data)) media.images.push(data)
+      else if (VIDEO_EXT_RE.test(data)) media.videos.push(data)
+    }
+    return
+  }
+
+  if (Array.isArray(data)) {
+    for (const item of data) collectMediaUrls(item, media, depth + 1)
+    return
+  }
+
+  if (typeof data !== 'object') return
+  const obj = data as Record<string, unknown>
+
+  // Anthropic image block: { type: "image", source: { type: "url"|"base64", ... } }
+  if (obj.type === 'image') {
+    if (obj.source && typeof obj.source === 'object') {
+      const src = obj.source as Record<string, unknown>
+      if (src.type === 'url' && typeof src.url === 'string') {
+        media.images.push(src.url)
+        return
+      }
+      if (src.type === 'base64' && typeof src.data === 'string' && (src.data as string).length < 500_000) {
+        media.images.push(`data:${src.media_type ?? 'image/png'};base64,${src.data}`)
+        return
+      }
+    }
+    // MCP image: { type: "image", data: "...", mimeType: "..." }
+    if (typeof obj.data === 'string' && (obj.data as string).length < 500_000) {
+      media.images.push(`data:${typeof obj.mimeType === 'string' ? obj.mimeType : 'image/png'};base64,${obj.data}`)
+      return
+    }
+  }
+
+  // 常见 URL 字段（自动分类为图片或视频）
+  for (const key of ['url', 'image_url', 'imageUrl', 'src', 'image', 'video_url', 'videoUrl', 'video'] as const) {
+    const val = obj[key]
+    if (typeof val === 'string' && val.startsWith('http')) {
+      if (VIDEO_EXT_RE.test(val)) media.videos.push(val)
+      else if (IMAGE_EXT_RE.test(val)) media.images.push(val)
+      else media.images.push(val) // 无扩展名默认作为图片（CDN URL 等）
+    }
+  }
+
+  // 常见数组字段（递归）
+  for (const key of ['urls', 'images', 'content', 'data', 'results'] as const) {
+    if (Array.isArray(obj[key])) collectMediaUrls(obj[key], media, depth + 1)
+  }
+}
+
+/** 从工具结果文本中提取媒体 URL（支持 JSON 结构 + 正则匹配） */
+function extractMediaUrls(text: string): MediaUrls {
+  const media: MediaUrls = { images: [], videos: [] }
+
+  // 1. 尝试 JSON 解析，递归提取
+  try {
+    const parsed = JSON.parse(text)
+    collectMediaUrls(parsed, media)
+  } catch {
+    // 非 JSON，跳过
+  }
+
+  // 2. 正则：带图片扩展名的 URL
+  const imgRegex = /https?:\/\/[^\s"'<>\])]+\.(?:jpe?g|png|gif|webp)(?:\?[^\s"'<>\])]*)?/gi
+  const imgMatches = text.match(imgRegex) || []
+  media.images.push(...imgMatches)
+
+  // 3. 正则：带视频扩展名的 URL
+  const videoRegex = /https?:\/\/[^\s"'<>\])]+\.(?:mp4|webm|ogg|mov)(?:\?[^\s"'<>\])]*)?/gi
+  const videoMatches = text.match(videoRegex) || []
+  media.videos.push(...videoMatches)
+
+  // 4. 正则：Markdown 图片语法 ![alt](url)
+  const mdRegex = /!\[.*?\]\((https?:\/\/[^\s)]+)\)/g
+  let mdMatch
+  while ((mdMatch = mdRegex.exec(text)) !== null) {
+    const url = mdMatch[1]
+    if (VIDEO_EXT_RE.test(url)) media.videos.push(url)
+    else media.images.push(url)
+  }
+
+  // 去重
+  media.images = [...new Set(media.images)].filter((u) => u.startsWith('http') || u.startsWith('data:image'))
+  media.videos = [...new Set(media.videos)].filter((u) => u.startsWith('http'))
+
+  return media
+}
+
+/** 兼容：仅提取图片 URL（用于 ActivityDetails） */
+function extractImageUrls(text: string): string[] {
+  return extractMediaUrls(text).images
+}
+
 // ===== 尺寸配置 =====
 
 const SIZE = {
@@ -75,7 +195,24 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ className?: string }>> = 
 }
 
 function getToolIcon(toolName: string): React.ComponentType<{ className?: string }> {
+  if (toolName.startsWith('mcp__')) return Globe
   return TOOL_ICONS[toolName] ?? Wrench
+}
+
+/** 解析 MCP 工具名称：mcp__serverName__toolName → { server, tool } */
+function parseMcpToolName(toolName: string): { server: string; tool: string } | null {
+  if (!toolName.startsWith('mcp__')) return null
+  const rest = toolName.slice(5) // 去掉 'mcp__'
+  const idx = rest.indexOf('__')
+  if (idx === -1) return null
+  return { server: rest.slice(0, idx), tool: rest.slice(idx + 2) }
+}
+
+/** 格式化工具名称，MCP 工具显示为 "server · tool" */
+function formatToolName(toolName: string): string {
+  const mcp = parseMcpToolName(toolName)
+  if (mcp) return `${mcp.server} · ${mcp.tool}`
+  return toolName
 }
 
 // ===== 状态图标 =====
@@ -301,7 +438,7 @@ function ActivityRow({ activity, index = 0, animate = false, onOpenDetails }: Ac
     >
       <StatusIcon status={status} toolName={activity.toolName} />
 
-      <span className="shrink-0 text-foreground/80">{activity.toolName}</span>
+      <span className="shrink-0 text-foreground/80">{formatToolName(activity.toolName)}</span>
 
       {diffStats && <DiffBadges stats={diffStats} />}
 
@@ -467,14 +604,39 @@ function ActivityDetails({ activity, onClose }: { activity: ToolActivity; onClos
         {activity.result && (
           <div>
             <div className="text-[10px] font-medium text-foreground/40 mb-1">结果</div>
-            <pre
-              className={cn(
-                'text-[11px] rounded p-2 overflow-x-auto max-h-[150px] overflow-y-auto whitespace-pre-wrap break-all',
-                activity.isError ? 'text-destructive/80 bg-destructive/5' : 'text-foreground/60 bg-background/50',
-              )}
-            >
-              {activity.result.length > 2000 ? activity.result.slice(0, 2000) + '\n… [截断]' : activity.result}
-            </pre>
+            {/* 检测结果中是否包含图片 URL，如果有则渲染图片预览 */}
+            {(() => {
+              const imageUrls = extractImageUrls(activity.result)
+              return imageUrls.length > 0 ? (
+                <div className="space-y-2">
+                  <div className="flex flex-wrap gap-2">
+                    {imageUrls.slice(0, 4).map((url, i) => (
+                      <img
+                        key={i}
+                        src={url}
+                        alt={`结果图片 ${i + 1}`}
+                        className="max-w-[200px] max-h-[200px] rounded-lg object-cover cursor-pointer hover:opacity-80 transition-opacity"
+                        loading="lazy"
+                        onClick={() => window.electronAPI.openExternal(url)}
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+                      />
+                    ))}
+                  </div>
+                  <pre className="text-[11px] text-foreground/60 bg-background/50 rounded p-2 overflow-x-auto max-h-[100px] overflow-y-auto whitespace-pre-wrap break-all">
+                    {activity.result.length > 2000 ? activity.result.slice(0, 2000) + '\n… [截断]' : activity.result}
+                  </pre>
+                </div>
+              ) : (
+                <pre
+                  className={cn(
+                    'text-[11px] rounded p-2 overflow-x-auto max-h-[150px] overflow-y-auto whitespace-pre-wrap break-all',
+                    activity.isError ? 'text-destructive/80 bg-destructive/5' : 'text-foreground/60 bg-background/50',
+                  )}
+                >
+                  {activity.result.length > 2000 ? activity.result.slice(0, 2000) + '\n… [截断]' : activity.result}
+                </pre>
+              )
+            })()}
           </div>
         )}
       </div>
@@ -497,6 +659,65 @@ function IntermediateRow({ text, index, animate }: { text: string; index: number
     >
       <MessageCircleDashed className={cn(SIZE.icon, 'text-muted-foreground/50')} />
       <span className="truncate flex-1">{text}</span>
+    </div>
+  )
+}
+
+// ===== 工具结果媒体内联预览（图片 + 视频） =====
+
+/** 从所有已完成的工具活动中提取媒体并内联展示 */
+function InlineToolMedia({ activities }: { activities: ToolActivity[] }): React.ReactElement | null {
+  const allMedia = React.useMemo(() => {
+    const media: MediaUrls = { images: [], videos: [] }
+    for (const activity of activities) {
+      if (activity.done && activity.result && !activity.isError) {
+        const result = extractMediaUrls(activity.result)
+        media.images.push(...result.images)
+        media.videos.push(...result.videos)
+      }
+    }
+    media.images = [...new Set(media.images)]
+    media.videos = [...new Set(media.videos)]
+    return media
+  }, [activities])
+
+  if (allMedia.images.length === 0 && allMedia.videos.length === 0) return null
+
+  return (
+    <div className="flex flex-col gap-2.5 mt-2">
+      {/* 视频播放器 */}
+      {allMedia.videos.slice(0, 4).map((url) => (
+        <video
+          key={url}
+          src={url}
+          controls
+          preload="metadata"
+          className="max-w-full md:max-w-[520px] h-auto rounded-xl shadow-sm"
+        />
+      ))}
+      {/* 图片预览 */}
+      {allMedia.images.length > 0 && (
+        <div className="flex flex-wrap gap-2.5">
+          {allMedia.images.slice(0, 8).map((url) => (
+            <img
+              key={url}
+              src={url}
+              alt="工具生成图片"
+              className={cn(
+                'rounded-xl object-cover cursor-pointer hover:opacity-90 transition-all duration-200 shadow-sm',
+                allMedia.images.length === 1
+                  ? 'max-w-full md:max-w-[520px] h-auto'
+                  : 'max-w-[260px] max-h-[260px]',
+              )}
+              loading="lazy"
+              onClick={() => {
+                if (url.startsWith('http')) window.electronAPI.openExternal(url)
+              }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -626,6 +847,9 @@ export function ToolActivityList({ activities, animate = false }: ToolActivityLi
           {expanded ? '收起工具活动' : `展开全部 ${visibleRows} 项工具活动`}
         </button>
       )}
+
+      {/* 工具结果媒体内联预览 — 始终可见，不受折叠影响 */}
+      <InlineToolMedia activities={activities} />
     </div>
   )
 }

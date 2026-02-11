@@ -89,6 +89,7 @@ function createWindow(): void {
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
     },
     titleBarStyle: 'hiddenInset', // macOS style
     trafficLightPosition: { x: 18, y: 18 },
@@ -142,6 +143,10 @@ function createWindow(): void {
     mainWindow = null
   })
 }
+
+app.commandLine.appendSwitch('--no-sandbox')
+app.commandLine.appendSwitch('--disable-gpu-sandbox')
+app.commandLine.appendSwitch('--disable-gpu')
 
 app.whenReady().then(async () => {
   // 初始化运行时环境（Shell 环境 + Bun + Git 检测）

@@ -34,11 +34,17 @@ const CONFIG_VERSION = 1
  * - 去除尾部斜杠
  * - 确保包含 /v1（如果用户没填则自动补上）
  * - 如果已经包含 /v1 则不重复添加
+ * - 特殊处理：字节跳动 Coding Plan 的 URL 不自动添加 /v1
  *
  * 最终结果类似 https://api.anthropic.com/v1
  */
 function normalizeAnthropicBaseUrl(baseUrl: string): string {
   let url = baseUrl.trim().replace(/\/+$/, '')
+  
+  if (url.includes('/api/coding')) {
+    return url
+  }
+  
   if (!url.match(/\/v\d+$/)) {
     url = `${url}/v1`
   }

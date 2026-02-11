@@ -194,6 +194,129 @@ export function MessageAction({
 
 // ===== MessageResponse Markdown 渲染 =====
 
+/**
+ * 移除已通过 ![alt](url) 内联展示的冗余链接列表项。
+ * 例如：当消息中已有 ![猫](url1) 渲染图片时，
+ * 后续的 "1. [图片1](url1)" 或 "1. **[图片1](url1)**" 列表项会被自动移除。
+ * 同时清理孤立的引导文本（如"你可以通过以下链接查看："）。
+ */
+function removeRedundantImageLinks(content: string): string {
+  // 收集所有 ![...](url) 中的图片 URL（原始 + 去掉查询参数的版本）
+  const embeddedUrlsRaw = new Set<string>()
+  const embeddedUrlsBase = new Set<string>()
+  const imgPattern = /!\[[^\]]*\]\(([^)]+)\)/g
+  let m: RegExpExecArray | null
+  while ((m = imgPattern.exec(content)) !== null) {
+    const url = m[1]?.trim()
+    if (url) {
+      embeddedUrlsRaw.add(url)
+      // 去掉查询参数和 hash，用于模糊匹配
+      embeddedUrlsBase.add(url.split(/[?#]/)[0] ?? url)
+    }
+  }
+  if (embeddedUrlsRaw.size === 0) return content
+
+  /** 检查链接 URL 是否与已嵌入的图片 URL 匹配 */
+  const isMatchedUrl = (linkUrl: string): boolean => {
+    const trimmed = linkUrl.trim()
+    if (embeddedUrlsRaw.has(trimmed)) return true
+    return embeddedUrlsBase.has(trimmed.split(/[?#]/)[0] ?? trimmed)
+  }
+
+  // 逐行过滤：移除冗余链接列表项
+  // 支持格式：1. [text](url) | 1. **[text](url)** | - [text](url) | 1. [**text**](url) 等
+  let removedCount = 0
+  const lines = content.split('\n')
+  const filtered = lines.filter((line) => {
+    // 保留图片嵌入行本身
+    if (/^\s*!\[/.test(line)) return true
+    // 检测列表项中的链接（支持加粗包裹、加粗文字等格式）
+    const linkMatch = line.match(
+      /^\s*(?:\d+\.\s+|-\s+)\*{0,2}\[([^\]]*)\]\(([^)]+)\)\*{0,2}\s*$/
+    )
+    if (linkMatch?.[2] && isMatchedUrl(linkMatch[2])) {
+      removedCount++
+      return false
+    }
+    return true
+  })
+
+  if (removedCount === 0) return content
+
+  // 清理可能变成孤立的标题或引导文本
+  const result: string[] = []
+  for (let i = 0; i < filtered.length; i++) {
+    const line = filtered[i] ?? ''
+    const trimmedLine = line.trim()
+
+    // 检测 **xxx：** 或 **xxx:** 形式的加粗标题
+    if (/^\s*\*\*[^*]+[：:]\*\*\s*$/.test(line)) {
+      let j = i + 1
+      while (j < filtered.length && (filtered[j] ?? '').trim() === '') j++
+      const nextLine = filtered[j] ?? ''
+      if (j >= filtered.length || !/^\s*(?:\d+\.\s+|-\s+)/.test(nextLine)) {
+        continue // 跳过孤立标题
+      }
+    }
+
+    // 检测以冒号结尾的引导文本（如"你可以通过以下链接查看："）
+    // 条件：行尾为中文或英文冒号，且后续没有紧跟的列表项
+    if (/[：:]\s*$/.test(trimmedLine) && trimmedLine.length > 0) {
+      let j = i + 1
+      while (j < filtered.length && (filtered[j] ?? '').trim() === '') j++
+      const nextLine = filtered[j] ?? ''
+      // 后续没有列表项内容了，说明这个引导句已孤立
+      if (j >= filtered.length || !/^\s*(?:\d+\.\s+|-\s+)/.test(nextLine)) {
+        // 尝试去掉句尾的引导部分（"。你可以通过以下链接查看："→ "。"）
+        const introPattern = /[，。！？,.!?]\s*[^，。！？,.!?]*(?:链接|查看|如下|下方|点击)[^，。！？,.!?]*[：:]\s*$/
+        const cleaned = line.replace(introPattern, (match) => {
+          // 只保留原始标点
+          const punct = match.charAt(0)
+          return /[，。！？,.!?]/.test(punct) ? punct : ''
+        })
+        if (cleaned !== line) {
+          result.push(cleaned)
+          continue
+        }
+        // 如果整行都是引导文本（独立行），直接跳过
+        if (/^(?:.*(?:链接|查看|如下|下方|点击).*)?[：:]\s*$/.test(trimmedLine)) {
+          continue
+        }
+      }
+    }
+
+    result.push(line)
+  }
+
+  return result.join('\n').replace(/\n{3,}/g, '\n\n')
+}
+
+/** 判断 URL 是否指向视频文件 */
+function isVideoUrl(url: string): boolean {
+  try {
+    const pathname = new URL(url).pathname
+    return /\.(mp4|webm|ogg|mov)$/i.test(pathname)
+  } catch {
+    return /\.(mp4|webm|ogg|mov)(?:\?|#|$)/i.test(url)
+  }
+}
+
+/**
+ * 移除视频链接相关的冗余文本。
+ * 当消息中包含视频 URL 时，移除 "视频链接：" 标签前缀和 "点击链接观看" 说明文字。
+ */
+function removeRedundantVideoText(content: string): string {
+  if (!/https?:\/\/[^\s)]+\.(?:mp4|webm|ogg|mov)/i.test(content)) return content
+
+  let result = content
+  // 移除 "**视频链接：** " 或 "视频链接：" 前缀（保留后面的 URL）
+  result = result.replace(/\*{0,2}视频链接[：:]\*{0,2}\s*/g, '')
+  // 移除关于点击链接观看视频的说明文字
+  result = result.replace(/你可以直接点击[^。]*(?:观看|查看|下载)[^。]*[。.]\s*/g, '')
+
+  return result.replace(/\n{3,}/g, '\n\n')
+}
+
 interface MessageResponseProps {
   /** Markdown 内容 */
   children: string
@@ -203,6 +326,11 @@ interface MessageResponseProps {
 /** 使用 react-markdown 渲染 assistant 消息内容，代码块使用 Shiki 语法高亮 */
 export const MessageResponse = React.memo(
   function MessageResponse({ children, className }: MessageResponseProps): React.ReactElement {
+    const processedContent = React.useMemo(() => {
+      let content = removeRedundantImageLinks(children)
+      content = removeRedundantVideoText(content)
+      return content
+    }, [children])
     return (
       <div
         className={cn(
@@ -216,21 +344,81 @@ export const MessageResponse = React.memo(
         <Markdown
           remarkPlugins={[remarkGfm]}
           components={{
-            a: ({ href, children: linkChildren, ...linkProps }) => (
-              <a
-                {...linkProps}
-                href={href}
-                onClick={(e) => {
-                  e.preventDefault()
-                  if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
-                    window.electronAPI.openExternal(href)
-                  }
-                }}
-                title={href}
-              >
-                {linkChildren}
-              </a>
-            ),
+            img: ({ src, alt, ...imgProps }) => {
+              const [loaded, setLoaded] = React.useState(false)
+              const [error, setError] = React.useState(false)
+
+              if (error) {
+                return (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
+                    <span>🖼️</span>
+                    <a
+                      href={src}
+                      onClick={(e) => {
+                        e.preventDefault()
+                        if (src) window.electronAPI.openExternal(src)
+                      }}
+                      className="underline hover:text-foreground"
+                    >
+                      {alt || '查看图片'}
+                    </a>
+                  </span>
+                )
+              }
+
+              return (
+                <span className="block my-3">
+                  {!loaded && (
+                    <span className="block w-[320px] h-[200px] rounded-xl bg-muted/30 animate-pulse" />
+                  )}
+                  <img
+                    {...imgProps}
+                    src={src}
+                    alt={alt || '图片'}
+                    className={cn(
+                      'max-w-full md:max-w-[520px] h-auto rounded-xl shadow-sm cursor-pointer transition-opacity duration-300',
+                      loaded ? 'opacity-100' : 'opacity-0 absolute'
+                    )}
+                    loading="lazy"
+                    onLoad={() => setLoaded(true)}
+                    onError={() => setError(true)}
+                    onClick={() => {
+                      if (src) window.electronAPI.openExternal(src)
+                    }}
+                  />
+                </span>
+              )
+            },
+            a: ({ href, children: linkChildren, ...linkProps }) => {
+              // 视频 URL → 内联播放器
+              if (href && isVideoUrl(href)) {
+                return (
+                  <span className="block my-3">
+                    <video
+                      src={href}
+                      controls
+                      preload="metadata"
+                      className="max-w-full md:max-w-[520px] h-auto rounded-xl shadow-sm"
+                    />
+                  </span>
+                )
+              }
+              return (
+                <a
+                  {...linkProps}
+                  href={href}
+                  onClick={(e) => {
+                    e.preventDefault()
+                    if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+                      window.electronAPI.openExternal(href)
+                    }
+                  }}
+                  title={href}
+                >
+                  {linkChildren}
+                </a>
+              )
+            },
             pre: ({ children: preChildren }) => {
               // 检测子 <code> 元素的 className 是否包含 language-mermaid
               const codeChild = React.Children.toArray(preChildren).find(
@@ -261,7 +449,7 @@ export const MessageResponse = React.memo(
             },
           }}
         >
-          {children}
+          {processedContent}
         </Markdown>
       </div>
     )

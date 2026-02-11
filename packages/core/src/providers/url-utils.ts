@@ -8,13 +8,20 @@
  * 规范化 Anthropic Base URL
  *
  * 去除尾部斜杠，如果没有版本路径则追加 /v1。
+ * 特殊处理：字节跳动 Coding Plan 的 URL 不自动添加 /v1
  * 例如：
  * - "https://api.anthropic.com" → "https://api.anthropic.com/v1"
  * - "https://api.anthropic.com/v1" → 不变
  * - "https://proxy.example.com/v2/" → "https://proxy.example.com/v2"
+ * - "https://ark.cn-beijing.volces.com/api/coding" → 不变（字节跳动 Coding Plan）
  */
 export function normalizeAnthropicBaseUrl(baseUrl: string): string {
   let url = baseUrl.trim().replace(/\/+$/, '')
+  
+  if (url.includes('/api/coding')) {
+    return url
+  }
+  
   if (!url.match(/\/v\d+$/)) {
     url = `${url}/v1`
   }

@@ -39,6 +39,7 @@ import { getAgentWorkspacePath, getAgentSessionWorkspacePath } from './config-pa
 import { getRuntimeStatus } from './runtime-init'
 import { getWorkspaceMcpConfig, ensurePluginManifest } from './agent-workspace-manager'
 import { buildSystemPromptAppend, buildDynamicContext } from './agent-prompt-builder'
+import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk'
 
 /** 活跃的 AbortController 映射（sessionId → controller） */
 const activeControllers = new Map<string, AbortController>()
@@ -393,6 +394,18 @@ function convertSDKMessage(
     case 'result': {
       const msg = message as SDKResultMessage
 
+      // 刷新待发送的文本，避免最终助手回复丢失
+      // 主进程/渲染进程均有防重复检查，安全刷新不会导致文本重复
+      if (pendingText.value) {
+        events.push({
+          type: 'text_complete',
+          text: pendingText.value,
+          isIntermediate: false,
+          turnId: turnId.value || undefined,
+        })
+        pendingText.value = null
+      }
+
       const modelUsageEntries = Object.values(msg.modelUsage || {})
       const primaryModelUsage = modelUsageEntries[0]
 
@@ -522,11 +535,14 @@ export async function runAgent(
 
   // 累积文本用于持久化
   let accumulatedText = ''
+  let deltaTextForCurrentTurn = ''
   const accumulatedEvents: AgentEvent[] = []
   // SDK 确认的实际模型（从 system init 消息获取）
   let resolvedModel = modelId || 'claude-sonnet-4-5-20250929'
   // 收集 stderr 输出用于错误诊断（声明在 try 之前，确保 catch 可访问）
   const stderrChunks: string[] = []
+  // 标记是否已收到 SDK result 消息（用于判断 process exit 是否为非致命错误）
+  let receivedResult = false
 
   try {
     // 6. 动态导入 SDK（避免在 esbuild 打包时出问题）
@@ -586,7 +602,7 @@ export async function runAgent(
     }
 
     // 8. 构建工作区 MCP 服务器配置
-    const mcpServers: Record<string, Record<string, unknown>> = {}
+    const mcpServers: Record<string, McpServerConfig> = {}
     if (workspaceSlug) {
       const mcpConfig = getWorkspaceMcpConfig(workspaceSlug)
       for (const [name, entry] of Object.entries(mcpConfig.servers ?? {})) {
@@ -685,7 +701,7 @@ export async function runAgent(
 
       // 从 system init 消息中捕获 SDK 确认的模型 + 诊断 skills
       if (msg.type === 'system' && 'subtype' in msg && msg.subtype === 'init') {
-        const initMsg = msg as { model?: string; skills?: string[]; tools?: string[]; plugins?: Array<{ name: string; path: string }>; slash_commands?: string[] }
+        const initMsg = msg as { model?: string; skills?: string[]; tools?: string[]; plugins?: Array<{ name: string; path: string }>; slash_commands?: string[]; mcp_servers?: Array<{ name: string; status: string }> }
         if (typeof initMsg.model === 'string') {
           resolvedModel = initMsg.model
           console.log(`[Agent 服务] SDK 确认模型: ${resolvedModel}`)
@@ -695,6 +711,10 @@ export async function runAgent(
         console.log(`[Agent 服务][诊断] SDK init plugins: ${JSON.stringify(initMsg.plugins)}`)
         console.log(`[Agent 服务][诊断] SDK init tools 包含 Skill: ${initMsg.tools?.includes('Skill')}`)
         console.log(`[Agent 服务][诊断] SDK init slash_commands: ${JSON.stringify(initMsg.slash_commands)}`)
+        // MCP 服务器状态
+        if (initMsg.mcp_servers && initMsg.mcp_servers.length > 0) {
+          console.log(`[Agent 服务][诊断] MCP 服务器状态: ${JSON.stringify(initMsg.mcp_servers)}`)
+        }
       }
 
       // 捕获 SDK session_id 用于后续 resume（参考 craft-agents-oss）
@@ -755,6 +775,7 @@ export async function runAgent(
 
       // 从 result 消息中缓存 contextWindow（参考 craft-agents-oss）
       if (msg.type === 'result') {
+        receivedResult = true
         const resultMsg = msg as SDKResultMessage
         const modelUsageEntries = Object.values(resultMsg.modelUsage || {})
         const primaryModelUsage = modelUsageEntries[0]
@@ -768,6 +789,13 @@ export async function runAgent(
         // 累积文本
         if (event.type === 'text_delta') {
           accumulatedText += event.text
+          deltaTextForCurrentTurn += event.text
+        } else if (event.type === 'text_complete' && event.text) {
+          // 兜底：当没有收到 text_delta（如 MCP 工具调用后）时，使用 text_complete 的完整文本
+          if (deltaTextForCurrentTurn.length === 0) {
+            accumulatedText += event.text
+          }
+          deltaTextForCurrentTurn = ''
         }
         accumulatedEvents.push(event)
 
@@ -823,7 +851,55 @@ export async function runAgent(
     }
 
     const errorMessage = error instanceof Error ? error.message : '未知错误'
+
+    // 已收到 result 消息说明查询逻辑上已完成，process exit 是非致命的清理阶段错误
+    // 典型场景：MCP 工具调用完成后 Claude Code 子进程 exit code 1
+    if (receivedResult) {
+      console.warn(`[Agent 服务] 查询已完成但进程异常退出（降级为警告）:`, errorMessage)
+
+      // 持久化已累积的完整内容
+      if (accumulatedText || accumulatedEvents.length > 0) {
+        const assistantMsg: AgentMessage = {
+          id: randomUUID(),
+          role: 'assistant',
+          content: accumulatedText,
+          createdAt: Date.now(),
+          model: resolvedModel,
+          events: accumulatedEvents,
+        }
+        appendAgentMessage(sessionId, assistantMsg)
+      }
+
+      // 更新会话索引
+      try {
+        updateAgentSessionMeta(sessionId, {})
+      } catch {
+        // 索引更新失败不影响主流程
+      }
+
+      // 按正常完成处理（不显示红色错误）
+      webContents.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, { sessionId })
+
+      // 异步生成标题
+      autoGenerateTitle(sessionId, userMessage, channelId, modelId || 'claude-sonnet-4-5-20250929', webContents)
+      return
+    }
+
+    // 真正的错误：查询未完成就失败了
     console.error(`[Agent 服务] 执行失败:`, error)
+
+    // 保存已累积的部分内容（即使失败也不丢弃已有数据）
+    if (accumulatedText || accumulatedEvents.length > 0) {
+      const partialMsg: AgentMessage = {
+        id: randomUUID(),
+        role: 'assistant',
+        content: accumulatedText,
+        createdAt: Date.now(),
+        model: resolvedModel,
+        events: accumulatedEvents,
+      }
+      appendAgentMessage(sessionId, partialMsg)
+    }
 
     // 构建包含 stderr 诊断信息的错误消息
     const stderrOutput = stderrChunks.join('').trim()
