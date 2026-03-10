@@ -39,6 +39,16 @@ import { permissionService } from './agent-permission-service'
 import { askUserService } from './agent-ask-user-service'
 import { getMemoryConfig } from './memory-service'
 import { searchMemory, addMemory, formatSearchResult } from './memos-client'
+import {
+  findTeamLeadInboxPath,
+  pollInboxWithRetry,
+  markInboxAsRead,
+  formatInboxPrompt,
+  formatSummaryFallbackPrompt,
+  areAllWorkersIdle,
+  INBOX_RETRY_CONFIG,
+  type TaskNotificationSummary,
+} from './agent-team-reader'
 
 // ===== 类型定义 =====
 
@@ -148,6 +158,19 @@ function getRetryDelayMs(attempt: number): number {
 }
 
 /**
+ * 可中断的定时器
+ *
+ * 等待指定毫秒，如果 signal 被中止则立即 resolve。
+ */
+function timerWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) { resolve(); return }
+    const tid = setTimeout(resolve, ms)
+    signal.addEventListener('abort', () => { clearTimeout(tid); resolve() }, { once: true })
+  })
+}
+
+/**
  * 解析 SDK cli.js 路径
  *
  * SDK 作为 esbuild external 依赖，require.resolve 可在运行时解析实际路径。
@@ -248,11 +271,37 @@ function ensureRipgrepAvailable(cliPath: string): void {
 /** 最大回填消息条数 */
 const MAX_CONTEXT_MESSAGES = 20
 
+/** 单条工具摘要最大字符数 */
+const MAX_TOOL_SUMMARY_LENGTH = 200
+
+/**
+ * 从 assistant 消息的 events 中提取工具活动摘要
+ *
+ * 返回简要的工具名称 + 关键输入信息，帮助新 SDK 会话理解之前做过什么。
+ */
+function extractToolSummary(events: import('@proma/shared').AgentEvent[]): string {
+  const summaries: string[] = []
+  for (const event of events) {
+    if (event.type === 'tool_start') {
+      const input = event.input
+      // 提取关键输入参数（如 file_path、command 等）
+      const keyParam = input.file_path ?? input.command ?? input.path ?? input.query ?? ''
+      const paramStr = keyParam ? `: ${String(keyParam).slice(0, 100)}` : ''
+      summaries.push(`[tool: ${event.toolName}${paramStr}]`)
+    }
+  }
+  if (summaries.length === 0) return ''
+  const joined = summaries.join(' ')
+  return joined.length > MAX_TOOL_SUMMARY_LENGTH
+    ? joined.slice(0, MAX_TOOL_SUMMARY_LENGTH) + '...'
+    : joined
+}
+
 /**
  * 构建带历史上下文的 prompt
  *
  * 当 resume 不可用时，将最近消息拼接为上下文注入 prompt，
- * 让新 SDK 会话保留对话记忆。仅取 user/assistant 角色的文本内容。
+ * 让新 SDK 会话保留对话记忆。包含文本内容和工具活动摘要。
  */
 function buildContextPrompt(sessionId: string, currentUserMessage: string): string {
   const allMessages = getAgentSessionMessages(sessionId)
@@ -264,7 +313,17 @@ function buildContextPrompt(sessionId: string, currentUserMessage: string): stri
   const recent = history.slice(-MAX_CONTEXT_MESSAGES)
   const lines = recent
     .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
-    .map((m) => `[${m.role}]: ${m.content}`)
+    .map((m) => {
+      let line = `[${m.role}]: ${m.content}`
+      // assistant 消息附带工具活动摘要，减少迁移后的"失忆"感
+      if (m.role === 'assistant' && m.events && m.events.length > 0) {
+        const toolSummary = extractToolSummary(m.events)
+        if (toolSummary) {
+          line += `\n  工具活动: ${toolSummary}`
+        }
+      }
+      return line
+    })
 
   if (lines.length === 0) return currentUserMessage
 
@@ -566,7 +625,7 @@ export class AgentOrchestrator {
    * 通过 EventBus 分发 AgentEvent，通过 callbacks 发送控制信号。
    */
   async sendMessage(input: AgentSendInput, callbacks: SessionCallbacks): Promise<void> {
-    const { sessionId, userMessage, channelId, modelId, workspaceId, additionalDirectories } = input
+    const { sessionId, userMessage, channelId, modelId, workspaceId, additionalDirectories, customMcpServers, permissionModeOverride } = input
     const stderrChunks: string[] = []
 
     // 0. 并发保护
@@ -702,7 +761,10 @@ export class AgentOrchestrator {
       // 9.5 验证 sdkSessionId 是否仍然有效（SDK 0.2.53 listSessions）
       if (existingSdkSessionId) {
         try {
-          const sessions = await sdk.listSessions({ dir: agentCwd })
+          const listSessions = (sdk as unknown as {
+            listSessions: (opts: { dir: string }) => Promise<Array<{ sessionId: string }>>
+          }).listSessions
+          const sessions = await listSessions({ dir: agentCwd })
           const isValid = sessions.some((s: { sessionId: string }) => s.sessionId === existingSdkSessionId)
           if (!isValid) {
             console.log(`[Agent 编排] sdkSessionId 已失效 (${existingSdkSessionId})，将使用上下文注入`)
@@ -715,9 +777,15 @@ export class AgentOrchestrator {
         }
       }
 
-      // 10. 构建 MCP 服务器配置 + 记忆工具
+      // 10. 构建 MCP 服务器配置 + 记忆工具 + 自定义工具
       const mcpServers = this.buildMcpServers(workspaceSlug)
       await this.injectMemoryTools(sdk, mcpServers)
+
+      // 合并外部注入的自定义 MCP 服务器（如飞书群聊工具）
+      if (customMcpServers) {
+        Object.assign(mcpServers, customMcpServers)
+        console.log(`[Agent 编排] 已合并 ${Object.keys(customMcpServers).length} 个自定义 MCP 服务器`)
+      }
 
       // 11. 构建动态上下文和最终 prompt
       const dynamicCtx = buildDynamicContext({
@@ -742,10 +810,11 @@ export class AgentOrchestrator {
 
       // 12. 读取应用设置 + 获取权限模式
       const appSettings = getSettings()
-      const permissionMode: PromaPermissionMode = workspaceSlug
-        ? getWorkspacePermissionMode(workspaceSlug)
-        : (appSettings.agentPermissionMode ?? 'smart')
-      console.log(`[Agent 编排] 权限模式: ${permissionMode}`)
+      const permissionMode: PromaPermissionMode = permissionModeOverride
+        ?? (workspaceSlug
+          ? getWorkspacePermissionMode(workspaceSlug)
+          : (appSettings.agentPermissionMode ?? 'smart'))
+      console.log(`[Agent 编排] 权限模式: ${permissionMode}${permissionModeOverride ? '（外部覆盖）' : ''}`)
 
       const canUseTool = permissionMode !== 'auto'
         ? permissionService.createCanUseTool(
@@ -778,7 +847,9 @@ export class AgentOrchestrator {
         env: sdkEnv,
         ...(maxTurns != null && { maxTurns }),
         sdkPermissionMode: permissionMode === 'auto' ? 'bypassPermissions' : 'default',
-        allowDangerouslySkipPermissions: permissionMode === 'auto',
+        // 始终为 true：Worker 子代理使用 SDK 内部 mailbox 通信，
+        // 若不跳过权限检查会导致 Worker 阻塞超时并提前停止
+        allowDangerouslySkipPermissions: true,
         ...(canUseTool && { canUseTool }),
         ...(permissionMode !== 'auto' && { allowedTools: [...SAFE_TOOLS] }),
         systemPrompt: {
@@ -806,6 +877,7 @@ export class AgentOrchestrator {
           console.error(`[Agent SDK stderr] ${data}`)
         },
         onSessionId: (sdkSessionId: string) => {
+          capturedSdkSessionId = sdkSessionId
           if (sdkSessionId !== existingSdkSessionId) {
             try {
               updateAgentSessionMeta(sessionId, { sdkSessionId })
@@ -818,6 +890,9 @@ export class AgentOrchestrator {
         onModelResolved: (model: string) => {
           resolvedModel = model
           console.log(`[Agent 编排] SDK 确认模型: ${resolvedModel}`)
+          // 通知渲染进程更新流式状态中的模型信息
+          const modelEvent: AgentEvent = { type: 'model_resolved', model }
+          this.eventBus.emit(sessionId, modelEvent)
         },
         onContextWindow: (cw: number) => {
           console.log(`[Agent 编排] 缓存 contextWindow: ${cw}`)
@@ -826,9 +901,18 @@ export class AgentOrchestrator {
 
       console.log(`[Agent 编排] 开始通过 Adapter 遍历事件流...`)
 
-      // 14. 遍历 Adapter 产出的 AgentEvent 流（含自动重试）
+      // 14. 遍历 Adapter 产出的 AgentEvent 流（含自动重试 + Watchdog 死锁检测）
       let lastRetryableError: string | undefined
       let retrySucceeded = false
+
+      // Agent Teams 追踪
+      const startedTaskIds = new Set<string>()
+      const completedTaskIds = new Set<string>()
+      const taskNotificationSummaries: TaskNotificationSummary[] = []
+      /** 捕获到的 SDK session ID（用于 auto-resume 的 inbox 查找） */
+      let capturedSdkSessionId = existingSdkSessionId
+      /** Watchdog 触发标记（死锁被检测到时设为 true） */
+      let abortedByWatchdog = false
 
       for (let attempt = 1; attempt <= MAX_AUTO_RETRIES + 1; attempt++) {
         // 非首次尝试：等待 + 发送重试事件到 UI
@@ -866,7 +950,83 @@ export class AgentOrchestrator {
         let shouldRetryFromTypedError = false
 
         try {
-          for await (const event of this.adapter.query(queryOptions)) {
+          // 获取异步迭代器（手动 .next() 以支持 Promise.race 中断）
+          const queryIterable = this.adapter.query(queryOptions)
+          const queryIterator = queryIterable[Symbol.asyncIterator]()
+
+          // Watchdog 控制器（用于死锁检测后中断事件循环）
+          const loopAbort = new AbortController()
+          abortedByWatchdog = false
+
+          // 启动 Watchdog（每 5 秒检查是否所有 Worker 已 idle 但 Task 工具仍在等待）
+          const WATCHDOG_INTERVAL_MS = 5_000
+          const watchdogDone = (async () => {
+            while (!loopAbort.signal.aborted) {
+              await timerWithAbort(WATCHDOG_INTERVAL_MS, loopAbort.signal)
+              if (loopAbort.signal.aborted) break
+
+              // 仅在有 Worker 启动且未全部完成时检查
+              if (
+                startedTaskIds.size > 0 &&
+                completedTaskIds.size < startedTaskIds.size &&
+                capturedSdkSessionId
+              ) {
+                const allIdle = await areAllWorkersIdle(capturedSdkSessionId, startedTaskIds.size)
+                if (allIdle) {
+                  console.log(
+                    `[Agent 编排] Watchdog: 所有 ${startedTaskIds.size} 个 Worker 已 idle，` +
+                    `Task 工具仍在等待 — 中断以触发 auto-resume`,
+                  )
+                  abortedByWatchdog = true
+                  loopAbort.abort()
+                  break
+                }
+              }
+            }
+          })()
+
+          // 手动事件循环：Promise.race（事件 vs Watchdog 中断）
+          let pendingNext: Promise<IteratorResult<AgentEvent>> | null = null
+          // Teams 活跃时延迟 complete 事件，避免前端提前标记 teammates 为 stopped
+          let deferredCompleteEvent: AgentEvent | null = null
+
+          while (!loopAbort.signal.aborted) {
+            if (!pendingNext) {
+              pendingNext = queryIterator.next()
+            }
+
+            const abortPromise = new Promise<null>((resolve) => {
+              if (loopAbort.signal.aborted) { resolve(null); return }
+              loopAbort.signal.addEventListener('abort', () => resolve(null), { once: true })
+            })
+
+            const raceResult = await Promise.race([
+              pendingNext.then((r) => ({ kind: 'event' as const, result: r })),
+              abortPromise.then(() => ({ kind: 'abort' as const, result: null })),
+            ])
+
+            if (raceResult.kind === 'abort') {
+              // Watchdog 触发：终止事件循环，但不中止 SDK 会话
+              // 注意：pending .next() 可能因 SDK 阻塞而永远不返回，
+              // 因此 .return() 也会排队挂起 — 不能 await，用超时保护
+              pendingNext?.catch(() => {})  // 防止未处理 rejection
+              pendingNext = null
+              const returnPromise = queryIterator.return?.(undefined as never).catch(() => {})
+              // 最多等 1 秒，超时则放弃（generator 稍后 GC 清理）
+              await Promise.race([
+                returnPromise,
+                new Promise<void>((r) => setTimeout(r, 1000)),
+              ])
+              console.log(`[Agent 编排] Watchdog 中断：已退出事件循环`)
+              break
+            }
+
+            const iterResult = raceResult.result
+            if (!iterResult || iterResult.done) break
+
+            pendingNext = null
+            const event = iterResult.value
+
             // typed_error：判断是否可自动重试
             if (event.type === 'typed_error') {
               if (isAutoRetryableTypedError(event.error) && attempt <= MAX_AUTO_RETRIES) {
@@ -879,7 +1039,7 @@ export class AgentOrchestrator {
                 accumulatedText = ''
                 accumulatedEvents.length = 0
                 shouldRetryFromTypedError = true
-                break  // 跳出 for-await，进入下一次 retry 循环
+                break  // 跳出事件循环，进入下一次 retry 循环
               }
 
               // 不可重试 → 走原有终止逻辑
@@ -917,6 +1077,9 @@ export class AgentOrchestrator {
               }
 
               this.eventBus.emit(sessionId, event)
+              // 清理 Watchdog
+              if (!loopAbort.signal.aborted) loopAbort.abort()
+              await watchdogDone
               try { updateAgentSessionMeta(sessionId, {}) } catch { /* 忽略 */ }
               callbacks.onComplete(getAgentSessionMessages(sessionId))
               return
@@ -927,7 +1090,39 @@ export class AgentOrchestrator {
               accumulatedText += event.text
             }
             accumulatedEvents.push(event)
-            this.eventBus.emit(sessionId, event)
+
+            // Agent Teams: 当有 teammate 活跃时，延迟 complete 事件
+            // 避免前端收到 complete → 标记所有 teammates 为 stopped → 建议不渲染
+            if (event.type === 'complete' && startedTaskIds.size > 0) {
+              console.log(`[Agent 编排] 延迟 complete 事件（${startedTaskIds.size} 个 teammate 活跃）`)
+              deferredCompleteEvent = event
+              // 不发射到 eventBus，继续等待 auto-resume
+            } else {
+              this.eventBus.emit(sessionId, event)
+            }
+
+            // Agent Teams: 追踪 teammate 任务状态
+            if (event.type === 'task_started') {
+              startedTaskIds.add(event.taskId)
+            } else if (event.type === 'task_notification') {
+              completedTaskIds.add(event.taskId)
+              if (event.summary) {
+                taskNotificationSummaries.push({
+                  taskId: event.taskId,
+                  status: event.status,
+                  summary: event.summary,
+                  outputFile: event.outputFile,
+                })
+              }
+            }
+          }
+
+          // 清理 Watchdog（事件循环正常结束或被 Watchdog 中断）
+          if (!loopAbort.signal.aborted) loopAbort.abort()
+          await watchdogDone
+
+          if (abortedByWatchdog) {
+            console.log(`[Agent 编排] Watchdog 中断了事件循环，将触发 auto-resume`)
           }
 
           // typed_error break 触发了 → 继续循环
@@ -944,7 +1139,88 @@ export class AgentOrchestrator {
 
           // 15. 持久化 assistant 消息
           this.persistAssistantMessage(sessionId, accumulatedText, accumulatedEvents, resolvedModel)
+
+          // 16. Agent Teams Auto-Resume：teammates 完成后自动收集结果并汇总
+          //     触发条件：有 teammate 启动过（正常完成或 Watchdog 中断均适用）
+          console.log(`[Agent 编排] Auto-resume 条件检查: startedTasks=${startedTaskIds.size}, sdkSession=${!!capturedSdkSessionId}, active=${this.activeSessions.has(sessionId)}`)
+          if (startedTaskIds.size > 0 && capturedSdkSessionId && this.activeSessions.has(sessionId)) {
+            console.log(`[Agent 编排] Agent Teams 检测到 ${startedTaskIds.size} 个 teammate，启动 auto-resume`)
+
+            // 通知前端：正在收集 teammate 结果
+            this.eventBus.emit(sessionId, {
+              type: 'waiting_resume',
+              message: '正在收集 teammate 工作结果...',
+            })
+
+            // 构造 resume prompt（优先 inbox，fallback 到 summaries）
+            let resumePrompt: string | null = null
+
+            const inboxInfo = await findTeamLeadInboxPath(capturedSdkSessionId)
+            console.log(`[Agent 编排] Inbox 查找结果: ${inboxInfo ? `team=${inboxInfo.teamName}` : '未找到 team'}`)
+            if (inboxInfo) {
+              const unreadMessages = await pollInboxWithRetry(
+                inboxInfo.inboxPath,
+                INBOX_RETRY_CONFIG,
+              )
+              if (unreadMessages.length > 0) {
+                await markInboxAsRead(inboxInfo.inboxPath)
+                resumePrompt = formatInboxPrompt(unreadMessages)
+                console.log(`[Agent 编排] 使用 ${unreadMessages.length} 条 inbox 消息构建 resume prompt`)
+              }
+            }
+
+            // Fallback：用 task_notification summaries
+            if (!resumePrompt && taskNotificationSummaries.length > 0) {
+              console.log(`[Agent 编排] Inbox 为空，使用 ${taskNotificationSummaries.length} 条 task summaries 作为 fallback`)
+              resumePrompt = formatSummaryFallbackPrompt(taskNotificationSummaries)
+            }
+
+            if (resumePrompt && this.activeSessions.has(sessionId)) {
+              const resumeMessageId = randomUUID()
+              this.eventBus.emit(sessionId, { type: 'resume_start', messageId: resumeMessageId })
+
+              // 创建 resume 查询（使用相同的 SDK session ID）
+              let resumeText = ''
+              const resumeEvents: AgentEvent[] = []
+
+              try {
+                const resumeOptions: ClaudeAgentQueryOptions = {
+                  ...queryOptions,
+                  prompt: resumePrompt,
+                  resumeSessionId: capturedSdkSessionId,
+                }
+
+                for await (const event of this.adapter.query(resumeOptions)) {
+                  if (!this.activeSessions.has(sessionId)) break
+
+                  if (event.type === 'text_delta') {
+                    resumeText += event.text
+                  }
+                  resumeEvents.push(event)
+                  this.eventBus.emit(sessionId, event)
+                }
+
+                // 持久化 resume 助手消息
+                if (resumeText || resumeEvents.length > 0) {
+                  this.persistAssistantMessage(sessionId, resumeText, resumeEvents, resolvedModel)
+                }
+
+                console.log(`[Agent 编排] Auto-resume 完成，输出 ${resumeText.length} 字符`)
+              } catch (resumeError) {
+                console.error('[Agent 编排] Auto-resume 失败:', resumeError)
+                // 已流式的部分内容已保存，继续完成流程
+              }
+            } else if (!resumePrompt) {
+              console.log('[Agent 编排] 无可用的 resume 内容（inbox 和 summaries 均为空）')
+            }
+          }
           try { updateAgentSessionMeta(sessionId, {}) } catch { /* 忽略 */ }
+
+          // 发射延迟的 complete 事件（auto-resume 已完成，前端可安全处理）
+          if (deferredCompleteEvent) {
+            console.log(`[Agent 编排] 发射延迟的 complete 事件`)
+            this.eventBus.emit(sessionId, deferredCompleteEvent)
+          }
 
           // 发送完成信号
           callbacks.onComplete(getAgentSessionMessages(sessionId))

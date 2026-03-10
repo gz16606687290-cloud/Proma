@@ -6,7 +6,7 @@
  */
 
 import { contextBridge, ipcRenderer } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, MEMORY_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, MEMORY_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -47,6 +47,7 @@ import type {
   SkillMeta,
   WorkspaceCapabilities,
   FileEntry,
+  FileSearchResult,
   EnvironmentCheckResult,
   ProxyConfig,
   SystemProxyDetectResult,
@@ -65,7 +66,17 @@ import type {
   ChatToolInfo,
   ChatToolState,
   ChatToolMeta,
+  AgentTeamData,
   MoveSessionToWorkspaceInput,
+  FeishuConfig,
+  FeishuConfigInput,
+  FeishuBridgeState,
+  FeishuTestResult,
+  FeishuChatBinding,
+  FeishuPresenceReport,
+  FeishuNotifyMode,
+  FeishuNotificationSentPayload,
+  FeishuUpdateBindingInput,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 
@@ -144,6 +155,14 @@ export interface ElectronAPI {
 
   /** 切换对话置顶状态 */
   togglePinConversation: (id: string) => Promise<ConversationMeta>
+
+  // ===== 教程 =====
+
+  /** 获取教程内容 */
+  getTutorialContent: () => Promise<string | null>
+
+  /** 创建欢迎对话（含教程附件） */
+  createWelcomeConversation: () => Promise<ConversationMeta | null>
 
   // ===== 消息发送 =====
 
@@ -387,6 +406,14 @@ export interface ElectronAPI {
   /** 响应 AskUser 请求 */
   respondAskUser: (response: AskUserResponse) => Promise<void>
 
+  // ===== Agent Teams 数据 =====
+
+  /** 获取 Team 聚合数据（团队配置 + 任务列表 + 收件箱） */
+  getAgentTeamData: (sdkSessionId: string) => Promise<AgentTeamData | null>
+
+  /** 读取 Teammate 输出文件内容 */
+  getAgentOutput: (filePath: string) => Promise<string>
+
   // ===== Agent 附件 =====
 
   /** 保存文件到 Agent session 工作目录 */
@@ -417,6 +444,30 @@ export interface ElectronAPI {
 
   /** 在系统文件管理器中显示文件 */
   showInFolder: (filePath: string) => Promise<void>
+
+  /** 重命名文件/目录 */
+  renameFile: (filePath: string, newName: string) => Promise<void>
+
+  /** 移动文件/目录到目标目录 */
+  moveFile: (filePath: string, targetDir: string) => Promise<void>
+
+  /** 列出附加目录内容（无工作区路径限制） */
+  listAttachedDirectory: (dirPath: string) => Promise<FileEntry[]>
+
+  /** 用系统默认应用打开附加目录文件（无工作区路径限制） */
+  openAttachedFile: (filePath: string) => Promise<void>
+
+  /** 在文件管理器中显示附加目录文件（无工作区路径限制） */
+  showAttachedInFolder: (filePath: string) => Promise<void>
+
+  /** 重命名附加目录文件/目录（无工作区路径限制） */
+  renameAttachedFile: (filePath: string, newName: string) => Promise<void>
+
+  /** 移动附加目录文件/目录（无工作区路径限制） */
+  moveAttachedFile: (filePath: string, targetDir: string) => Promise<void>
+
+  /** 搜索工作区文件（用于 @ 引用，支持附加目录） */
+  searchWorkspaceFiles: (rootPath: string, query: string, limit?: number, additionalPaths?: string[]) => Promise<FileSearchResult>
 
   // ===== 系统提示词管理 =====
 
@@ -465,6 +516,37 @@ export interface ElectronAPI {
   // 工作区文件变化通知
   onCapabilitiesChanged: (callback: () => void) => () => void
   onWorkspaceFilesChanged: (callback: () => void) => () => void
+
+  // ===== 飞书集成 =====
+
+  /** 获取飞书配置 */
+  getFeishuConfig: () => Promise<FeishuConfig>
+  /** 获取解密后的 App Secret */
+  getDecryptedFeishuSecret: () => Promise<string>
+  /** 保存飞书配置（appSecret 为明文） */
+  saveFeishuConfig: (input: FeishuConfigInput) => Promise<FeishuConfig>
+  /** 测试飞书连接 */
+  testFeishuConnection: (appId: string, appSecret: string) => Promise<FeishuTestResult>
+  /** 启动飞书 Bridge */
+  startFeishuBridge: () => Promise<void>
+  /** 停止飞书 Bridge */
+  stopFeishuBridge: () => Promise<void>
+  /** 获取飞书 Bridge 状态 */
+  getFeishuStatus: () => Promise<FeishuBridgeState>
+  /** 获取活跃绑定列表 */
+  listFeishuBindings: () => Promise<FeishuChatBinding[]>
+  /** 更新绑定（修改工作区/会话） */
+  updateFeishuBinding: (input: FeishuUpdateBindingInput) => Promise<FeishuChatBinding | null>
+  /** 移除绑定 */
+  removeFeishuBinding: (chatId: string) => Promise<boolean>
+  /** 上报用户在场状态 */
+  reportFeishuPresence: (report: FeishuPresenceReport) => Promise<void>
+  /** 设置会话通知模式 */
+  setFeishuSessionNotify: (sessionId: string, mode: FeishuNotifyMode) => Promise<void>
+  /** 订阅飞书 Bridge 状态变化 */
+  onFeishuStatusChanged: (callback: (state: FeishuBridgeState) => void) => () => void
+  /** 订阅飞书通知已发送事件 */
+  onFeishuNotificationSent: (callback: (payload: FeishuNotificationSentPayload) => void) => () => void
 }
 
 /**
@@ -549,6 +631,15 @@ const electronAPI: ElectronAPI = {
 
   togglePinConversation: (id: string) => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.TOGGLE_PIN, id)
+  },
+
+  // 教程
+  getTutorialContent: () => {
+    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.GET_TUTORIAL_CONTENT)
+  },
+
+  createWelcomeConversation: () => {
+    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.CREATE_WELCOME_CONVERSATION)
   },
 
   // 消息发送
@@ -877,6 +968,15 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.ASK_USER_RESPOND, response)
   },
 
+  // Agent Teams 数据
+  getAgentTeamData: (sdkSessionId: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_TEAM_DATA, sdkSessionId)
+  },
+
+  getAgentOutput: (filePath: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_AGENT_OUTPUT, filePath)
+  },
+
   // 工作区文件变化通知
   onCapabilitiesChanged: (callback: () => void) => {
     const listener = (): void => callback()
@@ -928,6 +1028,38 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SHOW_IN_FOLDER, filePath)
   },
 
+  renameFile: (filePath: string, newName: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.RENAME_FILE, filePath, newName)
+  },
+
+  moveFile: (filePath: string, targetDir: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.MOVE_FILE, filePath, targetDir)
+  },
+
+  listAttachedDirectory: (dirPath: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.LIST_ATTACHED_DIRECTORY, dirPath)
+  },
+
+  openAttachedFile: (filePath: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.OPEN_ATTACHED_FILE, filePath)
+  },
+
+  showAttachedInFolder: (filePath: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SHOW_ATTACHED_IN_FOLDER, filePath)
+  },
+
+  renameAttachedFile: (filePath: string, newName: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.RENAME_ATTACHED_FILE, filePath, newName)
+  },
+
+  moveAttachedFile: (filePath: string, targetDir: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.MOVE_ATTACHED_FILE, filePath, targetDir)
+  },
+
+  searchWorkspaceFiles: (rootPath: string, query: string, limit = 20, additionalPaths?: string[]) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SEARCH_WORKSPACE_FILES, rootPath, query, limit, additionalPaths)
+  },
+
   // 系统提示词管理
   getSystemPromptConfig: () => {
     return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.GET_CONFIG)
@@ -975,6 +1107,68 @@ const electronAPI: ElectronAPI = {
 
   getReleaseByTag: (tag) => {
     return ipcRenderer.invoke(GITHUB_RELEASE_IPC_CHANNELS.GET_RELEASE_BY_TAG, tag)
+  },
+
+  // ===== 飞书集成 =====
+
+  getFeishuConfig: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.GET_CONFIG)
+  },
+
+  getDecryptedFeishuSecret: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.GET_DECRYPTED_SECRET)
+  },
+
+  saveFeishuConfig: (input: FeishuConfigInput) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.SAVE_CONFIG, input)
+  },
+
+  testFeishuConnection: (appId: string, appSecret: string) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.TEST_CONNECTION, appId, appSecret)
+  },
+
+  startFeishuBridge: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.START_BRIDGE)
+  },
+
+  stopFeishuBridge: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.STOP_BRIDGE)
+  },
+
+  getFeishuStatus: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.GET_STATUS)
+  },
+
+  listFeishuBindings: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.LIST_BINDINGS)
+  },
+
+  updateFeishuBinding: (input: FeishuUpdateBindingInput) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.UPDATE_BINDING, input)
+  },
+
+  removeFeishuBinding: (chatId: string) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.REMOVE_BINDING, chatId)
+  },
+
+  reportFeishuPresence: (report: FeishuPresenceReport) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.REPORT_PRESENCE, report)
+  },
+
+  setFeishuSessionNotify: (sessionId: string, mode: FeishuNotifyMode) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.SET_SESSION_NOTIFY, sessionId, mode)
+  },
+
+  onFeishuStatusChanged: (callback: (state: FeishuBridgeState) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: FeishuBridgeState): void => callback(state)
+    ipcRenderer.on(FEISHU_IPC_CHANNELS.STATUS_CHANGED, listener)
+    return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.STATUS_CHANGED, listener) }
+  },
+
+  onFeishuNotificationSent: (callback: (payload: FeishuNotificationSentPayload) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: FeishuNotificationSentPayload): void => callback(payload)
+    ipcRenderer.on(FEISHU_IPC_CHANNELS.NOTIFICATION_SENT, listener)
+    return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.NOTIFICATION_SENT, listener) }
   },
 }
 

@@ -10,6 +10,7 @@
 
 import * as React from 'react'
 import { useAtom, useSetAtom, useAtomValue } from 'jotai'
+import { toast } from 'sonner'
 import { Pin, PinOff, Settings, Plus, Trash2, Pencil, ChevronDown, ChevronRight, Plug, Zap, PanelLeftClose, PanelLeftOpen, ArrowRightLeft } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -421,9 +422,9 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   /** 重命名 Agent 会话标题 */
   const handleAgentRename = async (id: string, newTitle: string): Promise<void> => {
     try {
-      await window.electronAPI.updateAgentSessionTitle(id, newTitle)
+      const updated = await window.electronAPI.updateAgentSessionTitle(id, newTitle)
       setAgentSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, title: newTitle, updatedAt: Date.now() } : s))
+        prev.map((s) => (s.id === updated.id ? updated : s))
       )
       // 同步更新标签页标题
       setTabs((prev) => updateTabTitle(prev, id, newTitle))
@@ -445,7 +446,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   }
 
   /** 迁移会话到另一个工作区后的回调 */
-  const handleSessionMoved = (updatedSession: AgentSessionMeta): void => {
+  const handleSessionMoved = (updatedSession: AgentSessionMeta, targetWorkspaceName: string): void => {
     setAgentSessions((prev) =>
       prev.map((s) => (s.id === updatedSession.id ? updatedSession : s))
     )
@@ -457,6 +458,9 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
       setCurrentAgentSessionId(null)
     }
     setMoveTargetId(null)
+    toast.success('会话已迁移', {
+      description: `已迁移到「${targetWorkspaceName}」，请切换工作区查看`,
+    })
   }
 
   /** Agent 会话按工作区过滤 */
